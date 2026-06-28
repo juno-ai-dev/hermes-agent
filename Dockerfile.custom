@@ -1,0 +1,198 @@
+# syntax=docker/dockerfile:1.7
+#
+# Custom Hermes Agent image with extended dev tooling.
+#
+# Derived development-agent image for chain work across Cosmos (Cosmos SDK +
+# CosmWasm), EVM (Foundry), and the WebAssembly Component Model (WASI p1/p2).
+# Keeps the default Hermes runtime image unchanged and layers compiler
+# toolchains, language runtimes, and common repo automation on top for agent
+# workspaces mounted under /opt/data.
+#
+# Build locally after building/pulling the base Hermes image:
+#   docker build -t hermes-agent:custom -f Dockerfile.custom .
+#
+ARG HERMES_BASE_IMAGE=nousresearch/hermes-agent:latest
+FROM ${HERMES_BASE_IMAGE}
+
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Versions are ARGs so downstream images can bump tooling without editing the
+# Dockerfile body. Keep these values conservative and broadly compatible with
+# Cosmos SDK chains, CosmWasm contracts, EVM/Foundry development, WASI
+# components, and the DAO DAO/Juno web apps.
+ARG BUF_VERSION=v1.50.0
+ARG CARGO_GENERATE_VERSION=0.22.1
+ARG CARGO_RUN_SCRIPT_VERSION=0.2.0
+ARG COSMWASM_CHECK_VERSION=2.1.5
+ARG PNPM_VERSION=10.12.1
+ARG RUST_TOOLCHAIN=stable
+ARG WASMVM_VERSION=v3.0.4
+ARG YARN_VERSION=1.22.22
+
+# System toolchain and common agent utilities.
+# - build-essential/clang/lld/pkg-config/libssl-dev/libudev-dev: common Cosmos
+#   SDK, wasmd, CosmWasm, EVM, and frontend native module build requirements.
+# - golang-go/protobuf-compiler: Go chain work plus proto generation.
+# - binaryen: provides wasm-opt for optimized CosmWasm artifacts.
+# - gh/jq/just: common repo automation tools.
+# - git-delta/fd-find: nicer diff viewer and `find` replacement used by many
+#   agent skills (the base image already ships ripgrep).
+# - pipx: install standalone Python CLIs into isolated venvs without touching
+#   /usr/lib/python3 (uv is provided by the base image for project deps).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      bash-completion \
+      binaryen \
+      build-essential \
+      clang \
+      curl \
+      fd-find \
+      gh \
+      git \
+      git-delta \
+      golang-go \
+      jq \
+      just \
+      less \
+      libssl-dev \
+      libudev-dev \
+      lld \
+      make \
+      pipx \
+      pkg-config \
+      protobuf-compiler \
+      unzip \
+      wget \
+      xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust/CosmWasm/WASI build stack. Install the toolchain and durable,
+# image-level cargo tools under /usr/local, but configure runtime caches under
+# /opt/data so contract builds persist across container recreates and never
+# write secrets or mutable build state into /opt/hermes.
+#
+# Targets:
+#   - wasm32-unknown-unknown: CosmWasm contracts.
+#   - wasm32-wasip1, wasm32-wasip2: WASI preview 1 + 2 components
+#     (cargo-component, wit-bindgen, the WebAssembly Component Model).
+#
+# Cargo tools (latest crates.io release — not pinned with ARG):
+#   - wasm-tools: low-level component/module munging.
+#   - cargo-component: build .wasm components from Rust.
+#   - wit-bindgen-cli: generate guest/host bindings from WIT.
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH="/usr/local/cargo/bin:${PATH}"
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- \
+      -y \
+      --no-modify-path \
+      --profile minimal \
+      --default-toolchain "${RUST_TOOLCHAIN}" && \
+    rustup target add wasm32-unknown-unknown wasm32-wasip1 wasm32-wasip2 && \
+    cargo install --locked --root /usr/local cargo-generate --version "${CARGO_GENERATE_VERSION}" && \
+    cargo install --locked --root /usr/local cargo-run-script --version "${CARGO_RUN_SCRIPT_VERSION}" && \
+    cargo install --locked --root /usr/local cosmwasm-check --version "${COSMWASM_CHECK_VERSION}" && \
+    cargo install --locked --root /usr/local wasm-tools && \
+    cargo install --locked --root /usr/local cargo-component && \
+    cargo install --locked --root /usr/local wit-bindgen-cli && \
+    chmod -R a+rX,go-w /usr/local/rustup /usr/local/cargo /usr/local/bin
+
+# buf is installed with Go so we avoid a separate release-asset matrix. GOBIN is
+# set only for this layer; runtime GOPATH/GOBIN below point at /opt/data.
+RUN GOBIN=/usr/local/bin go install "github.com/bufbuild/buf/cmd/buf@${BUF_VERSION}" && \
+    chmod 0755 /usr/local/bin/buf
+
+# The base image already provides Node 22 + npm + corepack. Activate package
+# managers expected by DAO DAO UI, Juno website, and DEX UI repositories.
+RUN corepack enable && \
+    corepack prepare "pnpm@${PNPM_VERSION}" --activate && \
+    corepack prepare "yarn@${YARN_VERSION}" --activate && \
+    npm cache clean --force
+
+# libwasmvm — the CosmWasm VM shared library. Required by
+# `cargo test --features test-tube` in dao-contracts and by any cgo-linked
+# Cosmos SDK chain binary built inside the container (e.g. wasmd, junod).
+RUN ARCH="$(dpkg --print-architecture)"; \
+    case "${ARCH}" in \
+      amd64) WASMARCH=x86_64 ;; \
+      arm64) WASMARCH=aarch64 ;; \
+      *) echo "unsupported arch: ${ARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o "/usr/lib/libwasmvm.${WASMARCH}.so" \
+      "https://github.com/CosmWasm/wasmvm/releases/download/${WASMVM_VERSION}/libwasmvm.${WASMARCH}.so" && \
+    ldconfig
+
+# Foundry — forge / cast / anvil / chisel for EVM contract development and
+# fork-mode local-node work. Installed system-wide under /usr/local/foundry so
+# every workspace user shares one toolchain; FOUNDRY_DIR is set on PATH below.
+ENV FOUNDRY_DIR=/usr/local/foundry
+RUN mkdir -p /usr/local/foundry/bin && \
+    curl -fsSL https://foundry.paradigm.xyz | bash && \
+    /usr/local/foundry/bin/foundryup && \
+    chmod -R a+rX,go-w /usr/local/foundry
+
+# mise — polyglot tool/version manager (https://github.com/jdx/mise). Useful
+# for per-project Go/Node/Python pins via .mise.toml without polluting the
+# image-level toolchains. Installed to /usr/local/bin so it's on PATH for
+# every user with no shell-rc edits.
+RUN curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh && \
+    chmod 0755 /usr/local/bin/mise
+
+# Persistent developer state belongs under /opt/data. Put language caches and
+# user-installed tools there by default while keeping baked tools on PATH.
+ENV CARGO_HOME=/opt/data/.cargo
+ENV GOPATH=/opt/data/go
+ENV GOBIN=/opt/data/go/bin
+ENV npm_config_cache=/opt/data/.npm
+ENV PNPM_HOME=/opt/data/.local/share/pnpm
+ENV PATH="/opt/data/.cargo/bin:/opt/data/go/bin:/opt/data/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/foundry/bin:${PATH}"
+
+# Pre-create cache/tool directories for non-root use. The base s6 stage2 hook
+# may remap/chown /opt/data again at runtime according to HERMES_UID/HERMES_GID.
+RUN mkdir -p \
+      /opt/data/.cargo \
+      /opt/data/.npm \
+      /opt/data/.local/bin \
+      /opt/data/.local/share/pnpm \
+      /opt/data/go/bin \
+      /opt/data/go/pkg \
+    && chown -R hermes:hermes /opt/data
+
+WORKDIR /opt/data
+
+# Build-time smoke test: fail fast if the image is missing any of the core
+# tools we layer on top of the base Hermes image. Run as the non-root hermes
+# user to catch PATH/cache permission regressions, then switch back to root so
+# the inherited s6-overlay entrypoint can run its cont-init.d UID/GID remap and
+# /opt/data ownership setup at container startup.
+USER hermes
+RUN set -eux; \
+    go version; \
+    rustc --version; \
+    cargo --version; \
+    rustup target list --installed | grep -qx wasm32-unknown-unknown; \
+    rustup target list --installed | grep -qx wasm32-wasip1; \
+    rustup target list --installed | grep -qx wasm32-wasip2; \
+    cosmwasm-check --version; \
+    wasm-opt --version; \
+    wasm-tools --version; \
+    cargo component --version; \
+    wit-bindgen --version; \
+    test -f /usr/lib/libwasmvm."$(dpkg --print-architecture | sed 's/amd64/x86_64/;s/arm64/aarch64/')".so; \
+    forge --version; \
+    cast --version; \
+    anvil --version; \
+    node --version; \
+    pnpm --version; \
+    yarn --version; \
+    buf --version; \
+    protoc --version; \
+    jq --version; \
+    just --version; \
+    mise --version; \
+    delta --version | head -n1; \
+    gh --version | head -n1
+
+USER root
