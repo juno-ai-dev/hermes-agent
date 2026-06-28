@@ -25,7 +25,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG BUF_VERSION=v1.50.0
 ARG CARGO_GENERATE_VERSION=0.22.1
 ARG CARGO_RUN_SCRIPT_VERSION=0.2.0
-ARG COSMWASM_CHECK_VERSION=2.1.5
+ARG COSMWASM_CHECK_VERSION=3.0.9
+# Toolchain used ONLY to build `cosmwasm-check`. Pinned to match upstream
+# CosmWasm CI (packages.yml: TOOLCHAIN_STABLE=1.82.0). cosmwasm-vm 3.x pulls
+# wasmer =5.0.6, whose wasmer_vm references __rust_probestack — a
+# compiler-builtins symbol Rust 1.83.0 removed on x86_64-linux. The pin is the
+# entire fix (no RUSTFLAGS workaround works); upstream wasmer 6.1.0-rc.2+
+# vendors the probestack and would let us drop this, but no cosmwasm-vm
+# release ships against wasmer 6 yet.
+ARG COSMWASM_VM_BUILD_TOOLCHAIN=1.82.0
 ARG PNPM_VERSION=10.12.1
 ARG RUST_TOOLCHAIN=stable
 ARG WASMVM_VERSION=v3.0.4
@@ -90,10 +98,11 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- \
       --no-modify-path \
       --profile minimal \
       --default-toolchain "${RUST_TOOLCHAIN}" && \
+    rustup toolchain install "${COSMWASM_VM_BUILD_TOOLCHAIN}" --profile minimal && \
     rustup target add wasm32-unknown-unknown wasm32-wasip1 wasm32-wasip2 && \
     cargo install --locked --root /usr/local cargo-generate --version "${CARGO_GENERATE_VERSION}" && \
     cargo install --locked --root /usr/local cargo-run-script --version "${CARGO_RUN_SCRIPT_VERSION}" && \
-    cargo install --locked --root /usr/local cosmwasm-check --version "${COSMWASM_CHECK_VERSION}" && \
+    cargo "+${COSMWASM_VM_BUILD_TOOLCHAIN}" install --locked --root /usr/local cosmwasm-check --version "${COSMWASM_CHECK_VERSION}" && \
     cargo install --locked --root /usr/local wasm-tools && \
     cargo install --locked --root /usr/local cargo-component && \
     cargo install --locked --root /usr/local wit-bindgen-cli && \
